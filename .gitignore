@@ -1,0 +1,5 @@
+.env
+__pycache__/
+project_doc.pdf
+artifacts/
+nodes/test_api.py
