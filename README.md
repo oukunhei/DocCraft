@@ -4,9 +4,14 @@ DocCraft 是一个 5 节点工作流：
 
 1. node1 预处理项目论文
 2. node2 提取模板槽位
-3. node3 检索外部信息
-4. node4 双 Agent 交叉分析
+3. node3 逐槽位生成草稿（Agent A）
+4. node4 逐槽位复查并记录问题（Agent B，仅标注不改写）
 5. node5 生成填充后的报告 docx
+
+引用与参考文献策略：
+
+- 非参考文献槽位：仅允许文内引用格式（如 `(Author, Year)` 或 `[1]`），严格忠于原论文证据。
+- 参考文献槽位：允许基于论文名或 DOI 进行联网检索补全，最终在文末“参考文献”章节输出APA格式条目。
 
 本项目已按 uv 方式包装，可直接用 uv run 命令启动。
 
@@ -73,14 +78,19 @@ uv run python flow.py \
 
 ## 输出位置
 
-- 中间产物：`artifacts/intermediate/node{1..4}/{run_id}/`
+- 中间产物：`artifacts/intermediate/node1/{run_id}/`
+- 中间产物：`artifacts/intermediate/node2/{run_id}/`
+- 中间产物：`artifacts/intermediate/node4a/{run_id}/`
+- 中间产物：`artifacts/intermediate/node5/{run_id}/`
 - 最终报告：`artifacts/final/report_filled_{run_id}.docx`
 - 复核清单：`artifacts/final/report_review_checklist_{run_id}.docx`
 
 ## 终端日志说明
 
 - node1 / node2：会打印 `start` / `done`（以及产物目录）
-- node3 / node4：会打印检索、争议和裁决过程
+- node3：会打印逐槽位生成进度（参考文献槽位会记录联网检索使用情况）
+- node4：会打印逐槽位复查进度与分歧统计
+- node5：会打印文档写入与输出信息
 
 如果 node2 走了回退逻辑，可查看：
 

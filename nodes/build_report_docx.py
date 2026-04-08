@@ -57,20 +57,8 @@ def _fallback_filled_slots(state: ReportState) -> Dict[str, str]:
             out["__source__"] = "analysis_notes"
             return out
 
-    # 2) 回退到仲裁Agent原始输出
-    judge = state.get("agent_judge_output") or {}
-    judge_slots = judge.get("slots") or []
+    # 2) 回退到Agent A草稿
     out: Dict[str, str] = {}
-    for item in judge_slots:
-        sid = str(item.get("slot_id") or "").strip()
-        text = str(item.get("final_text") or "").strip()
-        if sid and text:
-            out[sid] = text
-    if out:
-        out["__source__"] = "agent_judge_output"
-        return out
-
-    # 3) 最后回退到Agent A草稿
     agent_a = state.get("agent_a_output") or {}
     a_slots = agent_a.get("slots") or []
     for item in a_slots:
@@ -80,6 +68,18 @@ def _fallback_filled_slots(state: ReportState) -> Dict[str, str]:
             out[sid] = text
     if out:
         out["__source__"] = "agent_a_output"
+        return out
+
+    # 3) 最后回退到Agent B建议文本（仅在A缺失时兜底）
+    agent_b = state.get("agent_b_output") or {}
+    b_slots = agent_b.get("slots") or []
+    for item in b_slots:
+        sid = str(item.get("slot_id") or "").strip()
+        text = str(item.get("revised_text") or "").strip()
+        if sid and text:
+            out[sid] = text
+    if out:
+        out["__source__"] = "agent_b_output"
     return out
 
 
@@ -192,34 +192,16 @@ def _write_by_headings(
             unresolved.append(slot_id)
             continue
 
-        # 在首个命中标题后插入内容和元信息
+        # 在首个命中标题后插入内容
         idx = hit_indices[0]
         p_content = _insert_after_paragraph(doc, idx, content)
         inserted += 1
 
         conf = confidence_map.get(slot_id)
-        refs = source_map.get(slot_id, [])
-        flag = "是" if slot_id in review_flags else "否"
         uncertainty = uncertainty_map.get(slot_id) or {}
         u_level = str(uncertainty.get("level") or "low")
-        u_points = uncertainty.get("points") or []
-        u_human = uncertainty.get("human_needed") or []
-        first_point = str(u_points[0]) if u_points else "无"
-        meta = (
-            f"[AI草稿] 置信度: {conf} | 需人工复核: {flag} | 引用: {', '.join(refs) if refs else '无'}"
-            f" | 不确定等级: {u_level}"
-        )
-        p_meta = _insert_after_paragraph(doc, idx + 1, meta)
-        if u_points or u_human:
-            need_line = (
-                f"[不确定点] {first_point} | "
-                f"[需人工补充] {'; '.join(str(x) for x in u_human) if u_human else '无'}"
-            )
-            p_need = _insert_after_paragraph(doc, idx + 2, need_line)
-        else:
-            p_need = None
 
-        # 对低置信度/人工复核项高亮
+        # 对低置信度/人工复核项高亮正文
         low_conf = False
         try:
             low_conf = float(conf or 0.0) < 0.6
@@ -227,9 +209,6 @@ def _write_by_headings(
             low_conf = True
         if low_conf or slot_id in review_flags or u_level in {"medium", "high"}:
             _set_paragraph_highlight(p_content)
-            _set_paragraph_highlight(p_meta)
-            if p_need is not None:
-                _set_paragraph_highlight(p_need)
 
     return {"inserted_by_heading": inserted, "unresolved_slots": unresolved}
 
@@ -311,27 +290,11 @@ def _append_slots_as_section(
 
         appended += 1
         doc.add_heading(title, level=2)
-        doc.add_paragraph(content)
+        p_content = doc.add_paragraph(content)
 
         confidence = confidence_map.get(slot_id)
-        refs = source_map.get(slot_id, [])
-        flag = "是" if slot_id in review_flags else "否"
         uncertainty = uncertainty_map.get(slot_id) or {}
         u_level = str(uncertainty.get("level") or "low")
-        u_points = [str(x) for x in (uncertainty.get("points") or []) if str(x).strip()]
-        u_human = [str(x) for x in (uncertainty.get("human_needed") or []) if str(x).strip()]
-        note = (
-            f"置信度: {confidence} | 需人工复核: {flag} | 引用: {', '.join(refs) if refs else '无'}"
-            f" | 不确定等级: {u_level}"
-        )
-        p_note = doc.add_paragraph(note)
-        if u_points or u_human:
-            p_detail = doc.add_paragraph(
-                f"不确定点: {u_points[0] if u_points else '无'} | "
-                f"需人工补充: {'; '.join(u_human) if u_human else '无'}"
-            )
-        else:
-            p_detail = None
 
         low_conf = False
         try:
@@ -339,9 +302,7 @@ def _append_slots_as_section(
         except Exception:  # noqa: BLE001
             low_conf = True
         if low_conf or slot_id in review_flags or u_level in {"medium", "high"}:
-            _set_paragraph_highlight(p_note)
-            if p_detail is not None:
-                _set_paragraph_highlight(p_detail)
+            _set_paragraph_highlight(p_content)
 
     return appended
 
@@ -369,7 +330,7 @@ def build_report_docx(state: ReportState) -> Dict[str, Any]:
             "errors": {
                 "build_report_docx": (
                     "missing filled slots from node4 outputs "
-                    "(analysis_notes/agent_judge_output/agent_a_output are empty)"
+                    "(analysis_notes/agent_a_output/agent_b_output are empty)"
                 )
             }
         }
@@ -400,24 +361,41 @@ def build_report_docx(state: ReportState) -> Dict[str, Any]:
     review_flags = set(analysis_notes.get("review_flags") or [])
     uncertainty_map = analysis_notes.get("uncertainty_map") or {}
 
-    # 如果 analysis_notes 为空，尽量从仲裁输出补齐置信度与引用，降低节点耦合脆弱性。
+    # 如果 analysis_notes 不完整，回退使用 A/B 输出补齐置信度与引用。
     if not confidence_map or not source_map or not uncertainty_map:
-        judge = state.get("agent_judge_output") or {}
-        for item in judge.get("slots") or []:
+        for item in (state.get("agent_a_output") or {}).get("slots") or []:
             sid = str(item.get("slot_id") or "").strip()
             if not sid:
                 continue
             if sid not in confidence_map:
-                confidence_map[sid] = item.get("final_confidence")
+                confidence_map[sid] = item.get("confidence")
             if sid not in source_map:
                 source_map[sid] = item.get("source_refs") or []
             if sid not in uncertainty_map:
                 uncertainty_map[sid] = {
-                    "level": item.get("uncertainty_level") or "low",
-                    "points": item.get("uncertainty_points") or [],
-                    "human_needed": item.get("human_needed") or [],
+                    "level": "low",
+                    "points": item.get("risk_notes") or [],
+                    "human_needed": [],
                 }
-            if item.get("human_review_required") or item.get("needs_review"):
+            if float(item.get("confidence") or 0.0) < 0.6:
+                review_flags.add(sid)
+
+        for item in (state.get("agent_b_output") or {}).get("slots") or []:
+            sid = str(item.get("slot_id") or "").strip()
+            if not sid:
+                continue
+            if sid not in confidence_map:
+                confidence_map[sid] = item.get("confidence")
+            if sid not in source_map:
+                source_map[sid] = item.get("source_refs") or []
+            current = uncertainty_map.get(sid) or {"level": "low", "points": [], "human_needed": []}
+            points = list(current.get("points") or []) + list(item.get("disagreements") or [])
+            uncertainty_map[sid] = {
+                "level": "medium" if points else current.get("level", "low"),
+                "points": points,
+                "human_needed": current.get("human_needed") or [],
+            }
+            if points:
                 review_flags.add(sid)
 
     # 第一优先：按章节标题定位写入

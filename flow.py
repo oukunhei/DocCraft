@@ -9,8 +9,8 @@ from langgraph.graph import END, StateGraph
 
 from nodes.preprocess_paper import preprocess_project_paper
 from nodes.extract_templete_requirements import extract_template_requirements
-from nodes.search_related import search_related
-from nodes.analyze_slots_with_crosscheck import analyze_slots_with_crosscheck
+from nodes.generate_slot_drafts import generate_slot_drafts
+from nodes.review_slot_drafts import review_slot_drafts
 from nodes.build_report_docx import build_report_docx
 from state import ReportState
 
@@ -119,7 +119,7 @@ def _build_initial_state(args: argparse.Namespace) -> ReportState:
         "tool_base_url": tool_base_url,
         "tool_url": tool_base_url,
         "node4_current_round": 1,
-        "node4_max_rounds": 3,
+        "node4_max_rounds": 1,
         "node4_feedback_mode": node4_feedback_mode,
         "node4_cli_detail": node4_cli_detail,
         "node4_log_mode": node4_log_mode,
@@ -142,12 +142,12 @@ def _validate_paths(args: argparse.Namespace) -> None:
     os.makedirs(args.intermediate_dir, exist_ok=True)
 
 
-def _route_after_node4(state: ReportState) -> str:
+def _route_after_review(state: ReportState) -> str:
     if state.get("node4_feedback_pending"):
         return "end"
 
     errors = state.get("errors") or {}
-    if "analyze_slots_with_crosscheck" in errors:
+    if "review_slot_drafts" in errors:
         return "end"
 
     analysis_notes = state.get("analysis_notes") or {}
@@ -166,8 +166,8 @@ def build_graph() -> StateGraph[ReportState]:
     - 节点1内置：落盘 node1 中间结果
     - 节点2：解析报告模板技术内容 slot（extract_template_requirements）
     - 节点2内置：落盘 node2 中间结果
-    - 节点3：检索 related work 和相关新闻（search_related）
-    - 节点4：双Agent交叉验证分析（analyze_slots_with_crosscheck）
+    - 节点3：逐槽位生成草稿（generate_slot_drafts）
+    - 节点4：逐槽位复查并记录问题（review_slot_drafts）
     - 节点5：生成新的报告docx（build_report_docx）
     """
 
@@ -175,17 +175,17 @@ def build_graph() -> StateGraph[ReportState]:
 
     graph.add_node("preprocess_project_paper", preprocess_project_paper)
     graph.add_node("extract_template_requirements", extract_template_requirements)
-    graph.add_node("search_related", search_related)
-    graph.add_node("analyze_slots_with_crosscheck", analyze_slots_with_crosscheck)
+    graph.add_node("generate_slot_drafts", generate_slot_drafts)
+    graph.add_node("review_slot_drafts", review_slot_drafts)
     graph.add_node("build_report_docx", build_report_docx)
 
     graph.set_entry_point("preprocess_project_paper")
     graph.add_edge("preprocess_project_paper", "extract_template_requirements")
-    graph.add_edge("extract_template_requirements", "search_related")
-    graph.add_edge("search_related", "analyze_slots_with_crosscheck")
+    graph.add_edge("extract_template_requirements", "generate_slot_drafts")
+    graph.add_edge("generate_slot_drafts", "review_slot_drafts")
     graph.add_conditional_edges(
-        "analyze_slots_with_crosscheck",
-        _route_after_node4,
+        "review_slot_drafts",
+        _route_after_review,
         {
             "build_report_docx": "build_report_docx",
             "end": END,
@@ -212,9 +212,6 @@ def main() -> None:
 
     print("Doc summary:", final_state.get("doc_summary"))
     print("Template slots:", final_state.get("template_slots"))
-    prev_docs = final_state.get("previous_work_docs") or []
-    print("Previous work docs count:", len(prev_docs))
-    print("Search debug:", final_state.get("search_debug"))
     notes = final_state.get("analysis_notes") or {}
     print("Node4 filled slots count:", len((notes.get("filled_slots") or {}).keys()))
     print("Node4 review flags:", notes.get("review_flags"))
