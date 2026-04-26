@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, TypedDict
+import operator
+from typing import Annotated, Any, Dict, List, TypedDict
 
 from langchain_core.documents import Document
 
@@ -79,6 +80,15 @@ class ReportState(TypedDict, total=False):
     final_report_docx: str
     final_review_checklist_docx: str
     report_build_summary: Dict[str, Any]
+
+    # 新增：并行子图聚合输出（slot_id -> 最终输出）
+    slot_outputs: Annotated[Dict[str, Any], operator.ior]
+
+    # 新增：大纲规划结果
+    outline_plan: Dict[str, Any]
+
+    # 新增：一致性审查记录
+    consistency_issues: List[Dict[str, Any]]
 
     # 错误信息
     errors: Dict[str, str]

@@ -8,10 +8,8 @@ from typing import Any, Dict, List
 
 try:
     from docx import Document  # type: ignore
-    from docx.enum.text import WD_COLOR_INDEX  # type: ignore
 except Exception:  # noqa: BLE001
     Document = None
-    WD_COLOR_INDEX = None
 
 try:
     from state import ReportState
@@ -20,6 +18,16 @@ except Exception:  # noqa: BLE001
     if str(_ROOT) not in sys.path:
         sys.path.insert(0, str(_ROOT))
     from state import ReportState
+
+from nodes.docx_style import (
+    StyleSpec,
+    analyze_template_styles,
+    append_styled_section,
+    build_default_body_style,
+    insert_styled_paragraph,
+    replace_placeholders_preserve_format,
+    set_paragraph_highlight,
+)
 
 
 def _resolve_template_path(template_file: str | None) -> Path:
@@ -83,42 +91,6 @@ def _fallback_filled_slots(state: ReportState) -> Dict[str, str]:
     return out
 
 
-def _replace_placeholders(doc: Any, filled_slots: Dict[str, str]) -> int:
-    replaced = 0
-    patterns = []
-    for slot_id in filled_slots:
-        patterns.append("{{" + slot_id + "}}")
-        patterns.append("<<" + slot_id + ">>")
-        patterns.append("【" + slot_id + "】")
-
-    def replace_text(text: str) -> str:
-        nonlocal replaced
-        out = text
-        for slot_id, value in filled_slots.items():
-            for p in ("{{" + slot_id + "}}", "<<" + slot_id + ">>", "【" + slot_id + "】"):
-                if p in out:
-                    out = out.replace(p, value)
-                    replaced += 1
-        return out
-
-    for para in doc.paragraphs:
-        if para.text:
-            new_text = replace_text(para.text)
-            if new_text != para.text:
-                para.text = new_text
-
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                for para in cell.paragraphs:
-                    if para.text:
-                        new_text = replace_text(para.text)
-                        if new_text != para.text:
-                            para.text = new_text
-
-    return replaced
-
-
 def _normalize_text(s: str) -> str:
     return "".join(ch.lower() for ch in s if ch.isalnum() or "\u4e00" <= ch <= "\u9fff")
 
@@ -142,32 +114,6 @@ def _find_paragraph_indices_by_title(doc: Any, title: str) -> List[int]:
     return indices
 
 
-def _insert_after_paragraph(doc: Any, paragraph_index: int, text: str) -> Any:
-    # python-docx 没有直接的 insert_after，这里用 XML 层插入并返回新段落对象
-    paragraph = doc.paragraphs[paragraph_index]
-    from docx.oxml import OxmlElement  # type: ignore
-    from docx.text.paragraph import Paragraph  # type: ignore
-
-    new_p = OxmlElement("w:p")
-    paragraph._p.addnext(new_p)  # type: ignore[attr-defined]
-
-    new_para = Paragraph(new_p, paragraph._parent)
-    new_para.text = text
-    return new_para
-
-
-def _set_paragraph_highlight(paragraph: Any) -> None:
-    if WD_COLOR_INDEX is None:
-        return
-    if not paragraph.runs:
-        run = paragraph.add_run(paragraph.text)
-        paragraph.text = ""
-        run.font.highlight_color = WD_COLOR_INDEX.YELLOW
-        return
-    for run in paragraph.runs:
-        run.font.highlight_color = WD_COLOR_INDEX.YELLOW
-
-
 def _write_by_headings(
     doc: Any,
     slot_defs: List[Dict[str, Any]],
@@ -176,6 +122,8 @@ def _write_by_headings(
     source_map: Dict[str, Any],
     review_flags: set[str],
     uncertainty_map: Dict[str, Any],
+    style_map: Dict[str, StyleSpec],
+    default_body_style: StyleSpec,
 ) -> Dict[str, Any]:
     inserted = 0
     unresolved: List[str] = []
@@ -192,9 +140,10 @@ def _write_by_headings(
             unresolved.append(slot_id)
             continue
 
-        # 在首个命中标题后插入内容
+        # 在首个命中标题后插入内容，使用模板分析出的样式或默认正文样式
         idx = hit_indices[0]
-        p_content = _insert_after_paragraph(doc, idx, content)
+        spec = style_map.get(slot_id, default_body_style)
+        p_content = insert_styled_paragraph(doc, idx, content, spec, parse_markdown=True)
         inserted += 1
 
         conf = confidence_map.get(slot_id)
@@ -208,7 +157,7 @@ def _write_by_headings(
         except Exception:  # noqa: BLE001
             low_conf = True
         if low_conf or slot_id in review_flags or u_level in {"medium", "high"}:
-            _set_paragraph_highlight(p_content)
+            set_paragraph_highlight(p_content)
 
     return {"inserted_by_heading": inserted, "unresolved_slots": unresolved}
 
@@ -222,13 +171,22 @@ def _build_review_checklist_docx(
     source_map: Dict[str, Any],
     review_flags: set[str],
     uncertainty_map: Dict[str, Any],
+    default_body_style: StyleSpec,
 ) -> None:
     doc = Document()
-    doc.add_heading("报告复核清单", level=1)
-    doc.add_paragraph(f"Run ID: {run_id}")
+    # 标题应用字体防止等线
+    heading = doc.add_heading("报告复核清单", level=1)
+    for run in heading.runs:
+        default_body_style.apply_to_run(run)
+
+    p = doc.add_paragraph(f"Run ID: {run_id}")
+    for run in p.runs:
+        default_body_style.apply_to_run(run)
 
     if not review_flags:
-        doc.add_paragraph("当前没有被标记为人工复核的槽位。")
+        p = doc.add_paragraph("当前没有被标记为人工复核的槽位。")
+        for run in p.runs:
+            default_body_style.apply_to_run(run)
         doc.save(str(checklist_path))
         return
 
@@ -244,71 +202,61 @@ def _build_review_checklist_docx(
         u_points = [str(x) for x in (uncertainty.get("points") or []) if str(x).strip()]
         u_human = [str(x) for x in (uncertainty.get("human_needed") or []) if str(x).strip()]
 
-        doc.add_heading(f"{title} ({slot_id})", level=2)
-        doc.add_paragraph(f"置信度: {conf}")
-        doc.add_paragraph(f"引用: {', '.join(refs) if refs else '无'}")
-        doc.add_paragraph(f"不确定等级: {u_level}")
+        h = doc.add_heading(f"{title} ({slot_id})", level=2)
+        for run in h.runs:
+            default_body_style.apply_to_run(run)
+
+        def _add(label: str, text: str) -> None:
+            para = doc.add_paragraph(f"{label}: {text}")
+            for run in para.runs:
+                default_body_style.apply_to_run(run)
+
+        _add("置信度", str(conf))
+        _add("引用", ", ".join(refs) if refs else "无")
+        _add("不确定等级", u_level)
+
         if u_points:
-            doc.add_paragraph("具体不确定点:")
+            para = doc.add_paragraph("具体不确定点:")
+            for run in para.runs:
+                default_body_style.apply_to_run(run)
             for item in u_points:
-                doc.add_paragraph(item, style="List Bullet")
+                para = doc.add_paragraph(item, style="List Bullet")
+                for run in para.runs:
+                    default_body_style.apply_to_run(run)
         if u_human:
-            doc.add_paragraph("需要人工补充:")
+            para = doc.add_paragraph("需要人工补充:")
+            for run in para.runs:
+                default_body_style.apply_to_run(run)
             for item in u_human:
-                doc.add_paragraph(item, style="List Bullet")
-        doc.add_paragraph("建议检查项:")
-        doc.add_paragraph("1. 结论是否可由引用证据直接支持。")
-        doc.add_paragraph("2. 是否存在夸大、推断过度或遗漏反例。")
-        doc.add_paragraph("3. 表述是否符合参赛报告风格。")
-        doc.add_paragraph("当前草稿内容:")
+                para = doc.add_paragraph(item, style="List Bullet")
+                for run in para.runs:
+                    default_body_style.apply_to_run(run)
+
+        para = doc.add_paragraph("建议检查项:")
+        for run in para.runs:
+            default_body_style.apply_to_run(run)
+        for item in (
+            "1. 结论是否可由引用证据直接支持。",
+            "2. 是否存在夸大、推断过度或遗漏反例。",
+            "3. 表述是否符合参赛报告风格。",
+        ):
+            para = doc.add_paragraph(item)
+            for run in para.runs:
+                default_body_style.apply_to_run(run)
+
+        para = doc.add_paragraph("当前草稿内容:")
+        for run in para.runs:
+            default_body_style.apply_to_run(run)
         p = doc.add_paragraph(content if content else "[空]")
-        _set_paragraph_highlight(p)
+        for run in p.runs:
+            default_body_style.apply_to_run(run)
+        set_paragraph_highlight(p)
 
     doc.save(str(checklist_path))
 
 
-def _append_slots_as_section(
-    doc: Any,
-    section_title: str,
-    slot_defs: List[Dict[str, Any]],
-    filled_slots: Dict[str, str],
-    confidence_map: Dict[str, Any],
-    source_map: Dict[str, Any],
-    review_flags: set[str],
-    uncertainty_map: Dict[str, Any],
-) -> int:
-    appended = 0
-    doc.add_page_break()
-    doc.add_heading(section_title, level=1)
-
-    for slot in slot_defs:
-        slot_id = str(slot.get("slot_id"))
-        title = str(slot.get("title") or slot_id)
-        content = str(filled_slots.get(slot_id, "")).strip()
-        if not slot_id or not content:
-            continue
-
-        appended += 1
-        doc.add_heading(title, level=2)
-        p_content = doc.add_paragraph(content)
-
-        confidence = confidence_map.get(slot_id)
-        uncertainty = uncertainty_map.get(slot_id) or {}
-        u_level = str(uncertainty.get("level") or "low")
-
-        low_conf = False
-        try:
-            low_conf = float(confidence or 0.0) < 0.6
-        except Exception:  # noqa: BLE001
-            low_conf = True
-        if low_conf or slot_id in review_flags or u_level in {"medium", "high"}:
-            _set_paragraph_highlight(p_content)
-
-    return appended
-
-
 def build_report_docx(state: ReportState) -> Dict[str, Any]:
-    """节点5：基于模板创建新 docx 并填入节点4产出的槽位内容。"""
+    """节点5：基于模板创建新 docx 并填入节点4产出的槽位内容（带样式继承）。"""
 
     if Document is None:
         return {
@@ -353,9 +301,16 @@ def build_report_docx(state: ReportState) -> Dict[str, Any]:
     shutil.copy2(template_path, output_path)
 
     doc = Document(str(output_path))
-    replaced_count = _replace_placeholders(doc, filled_slots)
 
+    # ── 样式分析 ──
     slot_defs = _collect_slot_defs(template_slots)
+    slot_ids = [str(s.get("slot_id")) for s in slot_defs if s.get("slot_id")]
+    style_map = analyze_template_styles(doc, slot_ids)
+    default_body_style = build_default_body_style(doc)
+
+    # 占位符替换（保留格式）
+    replaced_count = replace_placeholders_preserve_format(doc, filled_slots, style_map)
+
     confidence_map = analysis_notes.get("slot_confidence") or {}
     source_map = analysis_notes.get("slot_sources") or {}
     review_flags = set(analysis_notes.get("review_flags") or [])
@@ -398,7 +353,7 @@ def build_report_docx(state: ReportState) -> Dict[str, Any]:
             if points:
                 review_flags.add(sid)
 
-    # 第一优先：按章节标题定位写入
+    # 第一优先：按章节标题定位写入（带样式克隆）
     heading_result = _write_by_headings(
         doc,
         slot_defs=slot_defs,
@@ -407,6 +362,8 @@ def build_report_docx(state: ReportState) -> Dict[str, Any]:
         source_map=source_map,
         review_flags=review_flags,
         uncertainty_map=uncertainty_map,
+        style_map=style_map,
+        default_body_style=default_body_style,
     )
     unresolved_ids = set(heading_result.get("unresolved_slots") or [])
     unresolved_slot_defs = [
@@ -419,27 +376,21 @@ def build_report_docx(state: ReportState) -> Dict[str, Any]:
 
     # 如果模板里没有占位符，就在文档末尾追加“AI生成草稿”章节。
     if replaced_count == 0 and heading_result["inserted_by_heading"] == 0:
-        appended_fallback_count = _append_slots_as_section(
+        appended_fallback_count = append_styled_section(
             doc=doc,
             section_title="AI 自动填充草稿（请人工复核）",
             slot_defs=slot_defs,
             filled_slots=filled_slots,
-            confidence_map=confidence_map,
-            source_map=source_map,
-            review_flags=review_flags,
-            uncertainty_map=uncertainty_map,
+            style_spec=default_body_style,
         )
     elif unresolved_slot_defs:
         # 关键改进：部分命中模板标题时，未命中的槽位也必须保留，避免最终报告丢段。
-        appended_fallback_count = _append_slots_as_section(
+        appended_fallback_count = append_styled_section(
             doc=doc,
             section_title="AI 自动补充草稿（未命中模板标题）",
             slot_defs=unresolved_slot_defs,
             filled_slots=filled_slots,
-            confidence_map=confidence_map,
-            source_map=source_map,
-            review_flags=review_flags,
-            uncertainty_map=uncertainty_map,
+            style_spec=default_body_style,
         )
 
     doc.save(str(output_path))
@@ -453,6 +404,7 @@ def build_report_docx(state: ReportState) -> Dict[str, Any]:
         source_map=source_map,
         review_flags=review_flags,
         uncertainty_map=uncertainty_map,
+        default_body_style=default_body_style,
     )
 
     summary = {
@@ -465,6 +417,8 @@ def build_report_docx(state: ReportState) -> Dict[str, Any]:
         "appended_unresolved_slots": appended_fallback_count,
         "unresolved_slots": heading_result["unresolved_slots"],
         "filled_slots_count": len(filled_slots),
+        "style_analyzed_slots": len(style_map),
+        "default_font": default_body_style.font_name,
     }
 
     return {

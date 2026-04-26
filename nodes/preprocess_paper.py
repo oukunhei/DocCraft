@@ -19,14 +19,14 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
 try:
-    # 优先导入项目内的 state.py
     from state import ReportState
+    from nodes.semantic_retrieval import build_retriever
 except Exception:  # noqa: BLE001
-    # 直接运行 nodes/preprocess_paper.py 时，先把项目根目录加入搜索路径
     _ROOT = Path(__file__).resolve().parents[1]
     if str(_ROOT) not in sys.path:
         sys.path.insert(0, str(_ROOT))
     from state import ReportState
+    from nodes.semantic_retrieval import build_retriever
 
 
 def _detect_language(text: str) -> str:
@@ -199,6 +199,23 @@ def preprocess_project_paper(state: ReportState) -> Dict[str, object]:
     )
 
     node1_dir = Path(intermediate_dir) / "node1" / run_id
+    # 构建语义检索索引（优雅降级：若 embedding API 不可用则静默跳过）
+    reasoning_api_key = state.get("reasoning_api_key")
+    reasoning_base_url = state.get("reasoning_base_url") or state.get("reasoning_url")
+    if reasoning_api_key and reasoning_base_url:
+        retriever = build_retriever(
+            run_id=run_id,
+            documents=chunks,
+            api_key=reasoning_api_key,
+            base_url=reasoning_base_url,
+        )
+        if retriever and retriever.vectorstore is not None:
+            print(f"[node1] semantic retriever built OK", flush=True)
+        else:
+            print(f"[node1] semantic retriever unavailable (fallback to keyword)", flush=True)
+    else:
+        print(f"[node1] semantic retriever skipped (no api config)", flush=True)
+
     print(
         (
             f"[node1] done: chunks={len(chunks)}, pages={total_pages}, language={main_lang}, "
